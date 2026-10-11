@@ -60,6 +60,9 @@ const HEADER_BLOCKLIST = ["traceparent", "tracestate"];
 // Cache key version — bump when changing the key format to bust stale entries
 const CACHE_KEY_PREFIX = "v6";
 const MAX_CACHE_KEY_BODY_BYTES = 1024 * 1024; // 1 MiB
+// Each streamed chunk is held until it is sent, so bound the count as well as
+// the bytes: a million one-byte chunks would cost far more than 1 MiB.
+const MAX_CACHE_KEY_BODY_CHUNKS = 16_384;
 
 // "Cache indefinitely" duration — mirrors upstream's CACHE_ONE_YEAR_SECONDS.
 const ONE_YEAR_SECONDS = 31536000;
@@ -388,6 +391,9 @@ async function readBodyStreamForCacheKey(
       // empty string still decides whether a runtime accepts the body.
       if (bytes.byteLength === 0 && (kind === "bytes" || lastPart?.kind === kind)) continue;
       readChunks.push(sentChunk);
+      if (readChunks.length > MAX_CACHE_KEY_BODY_CHUNKS) {
+        throw new SkipCacheKeyGenerationError();
+      }
       // A new part also adds its type tag to the key.
       totalBodyBytes += bytes.byteLength + (lastPart?.kind === kind ? 0 : kind.length + 1);
       if (totalBodyBytes > MAX_CACHE_KEY_BODY_BYTES) {
@@ -557,10 +563,11 @@ async function serializeBody(
         });
       } catch (err) {
         // Not keyed, but still sent as the string extracted. Only this
-        // uncached send reads the rest, as sending the string would.
-        (init as ExtendedRequestInit)._ogBody = decoder.decode(
-          await new Response(extracted).arrayBuffer(),
-        );
+        // uncached send reads the rest, as sending the string would. An
+        // aborted fetch sends no body, so it need not read the rest.
+        (init as ExtendedRequestInit)._ogBody = signal?.aborted
+          ? ""
+          : decoder.decode(await new Response(extracted).arrayBuffer());
         throw err;
       }
       const bytes = concatBodyBytes(parts.map((part) => part.bytes));

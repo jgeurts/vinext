@@ -3348,12 +3348,20 @@ describe("fetch cache shim", () => {
         expect(await read(streamOf("", encode("x")))).toBe(2);
         expect(await read(streamFrom([...empties, encode("x")]))).toBe(2);
 
-        // Alternating types add a tag per chunk, which alone exceeds the limit.
-        const alternating = Array.from({ length: 300_000 }, (_, i) =>
-          i % 2 === 0 ? "a" : encode("b"),
+        // Alternating types add a tag per chunk, which takes these bytes past
+        // the limit.
+        const alternating = Array.from({ length: 16_000 }, (_, i) =>
+          i % 2 === 0 ? "a".repeat(60) : encode("b".repeat(60)),
         );
         expect(await read(streamFrom(alternating))).toBe(3);
         expect(await read(streamFrom(alternating))).toBe(4);
+      });
+
+      it("skips the cache for a body of too many chunks and still sends all of it", async () => {
+        const chunks = Array.from({ length: 20_000 }, () => encode("x"));
+        expect(await read(streamFrom(chunks))).toBe(1);
+        expect(await read(streamFrom(chunks))).toBe(2);
+        expect(await sentChunks(0)).toHaveLength(20_000);
       });
 
       it("rejects an oversized chunk before copying it", async () => {
@@ -3538,6 +3546,26 @@ describe("fetch cache shim", () => {
       });
 
       expect((fetchMock.mock.calls[0][1] as RequestInit).body).toBe("\uFEFFvalue");
+    });
+
+    it("does not read the rest of a stringified body once aborted", async () => {
+      const controller = new AbortController();
+      controller.abort();
+      let stringified = 0;
+      await fetch("https://api.example.com/body-stringified-aborted", {
+        method: "POST",
+        body: {
+          toString: () => {
+            stringified++;
+            return "x".repeat(1024 * 1024);
+          },
+        } as unknown as BodyInit,
+        signal: controller.signal,
+        next: { revalidate: 60 },
+      }).catch(() => {});
+
+      expect(stringified).toBe(1);
+      expect((fetchMock.mock.calls[0][1] as RequestInit).body).toBe("");
     });
 
     it("sends an oversized stringified body as first stringified", async () => {
