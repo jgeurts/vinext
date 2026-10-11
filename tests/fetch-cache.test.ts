@@ -3538,6 +3538,38 @@ describe("fetch cache shim", () => {
       expect(stringified).toBe(1);
     });
 
+    it("rejects an iterable body like native fetch even when the response is cached", async () => {
+      async function* body() {
+        yield new TextEncoder().encode("same");
+      }
+      const url = "https://api.example.com/body-iterable-invalid";
+      await fetch(url, {
+        method: "POST",
+        body: body() as unknown as BodyInit,
+        duplex: "half",
+        next: { revalidate: 60 },
+      } as RequestInit);
+
+      // Node requires duplex for a streamed body and rejects keepalive with one.
+      await expect(
+        fetch(url, {
+          method: "POST",
+          body: body() as unknown as BodyInit,
+          next: { revalidate: 60 },
+        }),
+      ).rejects.toThrow(TypeError);
+      await expect(
+        fetch(url, {
+          method: "POST",
+          body: body() as unknown as BodyInit,
+          duplex: "half",
+          keepalive: true,
+          next: { revalidate: 60 },
+        } as RequestInit),
+      ).rejects.toThrow(TypeError);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
     it("sends a stringified body with its leading BOM", async () => {
       await fetch("https://api.example.com/body-stringified-bom", {
         method: "POST",
