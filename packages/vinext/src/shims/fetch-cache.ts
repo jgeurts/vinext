@@ -436,16 +436,13 @@ async function serializeBody(
     // Any other body the runtime accepts: async iterables (and sync ones on
     // Workers) or values it stringifies. Let the runtime extract the bytes it
     // will send, so different bodies never share a key.
-    let probe: Request;
-    try {
-      probe = new Request("http://localhost/", {
-        method: "POST",
-        body: init.body,
-        duplex: "half",
-      } as RequestInit);
-    } catch {
-      throw new SkipCacheKeyGenerationError();
-    }
+    // A body the runtime rejects rejects this fetch as natively, without
+    // extracting the body a second time.
+    const probe = new Request("http://localhost/", {
+      method: "POST",
+      body: init.body,
+      duplex: "half",
+    } as RequestInit);
     const probeBody = probe.body;
     if (!probeBody) {
       throw new SkipCacheKeyGenerationError();

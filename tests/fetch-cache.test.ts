@@ -3444,6 +3444,26 @@ describe("fetch cache shim", () => {
       });
     });
 
+    it("rejects like native fetch when extracting the body throws", async () => {
+      let stringified = 0;
+      const body = {
+        toString: () => {
+          if (stringified++ === 0) throw new Error("not yet");
+          return "second";
+        },
+      } as unknown as BodyInit;
+
+      await expect(
+        fetch("https://api.example.com/body-stringified-throws", {
+          method: "POST",
+          body,
+          next: { revalidate: 60 },
+        }),
+      ).rejects.toThrow("not yet");
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(stringified).toBe(1);
+    });
+
     it("sends a stringified body with its leading BOM", async () => {
       await fetch("https://api.example.com/body-stringified-bom", {
         method: "POST",
