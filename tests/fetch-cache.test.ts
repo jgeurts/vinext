@@ -3331,19 +3331,29 @@ describe("fetch cache shim", () => {
         expect(sent).not.toBe(lying);
       });
 
+      it("keys and sends an empty string chunk", async () => {
+        expect(await read(streamOf(new Uint8Array()))).toBe(1);
+        expect(await read(streamOf("", new Uint8Array(), ""))).toBe(2);
+        expect(await sentChunks(1)).toEqual([""]);
+      });
+
       it("drops empty chunks and counts type tags towards the key size limit", async () => {
+        const emptyBytes = Array.from({ length: 50_000 }, () => new Uint8Array());
         const empties = Array.from({ length: 50_000 }, (_, i) =>
           i % 2 === 0 ? "" : new Uint8Array(),
         );
         expect(await read(encode("x"))).toBe(1);
-        expect(await read(streamFrom([...empties, encode("x"), ...empties]))).toBe(1);
+        expect(await read(streamFrom([...emptyBytes, encode("x"), ...emptyBytes]))).toBe(1);
+        // A run of empty chunks keys like a single empty string.
+        expect(await read(streamOf("", encode("x")))).toBe(2);
+        expect(await read(streamFrom([...empties, encode("x")]))).toBe(2);
 
         // Alternating types add a tag per chunk, which alone exceeds the limit.
         const alternating = Array.from({ length: 300_000 }, (_, i) =>
           i % 2 === 0 ? "a" : encode("b"),
         );
-        expect(await read(streamFrom(alternating))).toBe(2);
         expect(await read(streamFrom(alternating))).toBe(3);
+        expect(await read(streamFrom(alternating))).toBe(4);
       });
 
       it("rejects an oversized chunk before copying it", async () => {
@@ -3551,6 +3561,30 @@ describe("fetch cache shim", () => {
       expect(await read("a")).toBe(1);
       expect(await read("b")).toBe(2);
       expect(await read("b")).toBe(2);
+    });
+
+    it("keys the content type inferred once a body's own code drops the header", async () => {
+      const read = async (body: BodyInit, headers?: Headers) => {
+        startNewFetchCacheScope();
+        const res = await fetch("https://api.example.com/body-drops-content-type", {
+          method: "POST",
+          headers,
+          body,
+          next: { revalidate: 60 },
+        });
+        return (await res.json()).count as number;
+      };
+      const headers = new Headers({ "content-type": "application/json" });
+      const body = {
+        toString: () => {
+          headers.delete("content-type");
+          return "same";
+        },
+      } as unknown as BodyInit;
+
+      expect(await read(new TextEncoder().encode("same"))).toBe(1);
+      expect(await read(body, headers)).toBe(2);
+      expect(await read("same")).toBe(2);
     });
 
     it("keys bodies the runtime stringifies by their string form", async () => {

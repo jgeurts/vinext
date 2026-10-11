@@ -383,10 +383,11 @@ async function readBodyStreamForCacheKey(
         throw new SkipCacheKeyGenerationError();
       }
 
-      // Empty chunks send nothing, so drop them instead of collecting them.
-      if (bytes.byteLength === 0) continue;
-      readChunks.push(sentChunk);
       const lastPart = parts.at(-1);
+      // An empty chunk sends nothing, so drop it unless it starts a part: an
+      // empty string still decides whether a runtime accepts the body.
+      if (bytes.byteLength === 0 && (kind === "bytes" || lastPart?.kind === kind)) continue;
+      readChunks.push(sentChunk);
       // A new part also adds its type tag to the key.
       totalBodyBytes += bytes.byteLength + (lastPart?.kind === kind ? 0 : kind.length + 1);
       if (totalBodyBytes > MAX_CACHE_KEY_BODY_BYTES) {
@@ -541,9 +542,9 @@ async function serializeBody(
       throw new SkipCacheKeyGenerationError();
     }
     const probeContentType = probe.headers.get("content-type") ?? undefined;
-    if (!hasEffectiveContentType) {
-      defaultContentType = probeContentType;
-    }
+    // Reading the body runs its own code, which may change the headers, so
+    // the key applies this type only if the final headers have none.
+    defaultContentType = probeContentType;
     if (probeContentType?.toLowerCase() === "text/plain;charset=utf-8") {
       // The runtime stringified the body. Send what it extracted, as
       // stringifying the original again may not give the same result.
