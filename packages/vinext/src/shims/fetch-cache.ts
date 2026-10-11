@@ -547,25 +547,23 @@ async function serializeBody(
     if (probeContentType?.toLowerCase() === "text/plain;charset=utf-8") {
       // The runtime stringified the body. Send what it extracted, as
       // stringifying the original again may not give the same result.
+      const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
+      let extracted!: ReadableStream<Uint8Array>;
       let parts: BodyStreamPart[];
       try {
         parts = await readBodyStreamForCacheKey(probeBody, signal, (body) => {
-          (init as ExtendedRequestInit)._ogBody = body;
+          extracted = body;
         });
       } catch (err) {
-        // Too large to key: stream the rest with the type the runtime gave it.
-        (init as RequestInit & { duplex?: string }).duplex = "half";
-        if (!hasEffectiveContentType) {
-          const headers = new Headers(getEffectiveRequestHeaders(input, init));
-          headers.set("content-type", probeContentType);
-          init.headers = headers;
-        }
+        // Not keyed, but still sent as the string extracted. Only this
+        // uncached send reads the rest, as sending the string would.
+        (init as ExtendedRequestInit)._ogBody = decoder.decode(
+          await new Response(extracted).arrayBuffer(),
+        );
         throw err;
       }
       const bytes = concatBodyBytes(parts.map((part) => part.bytes));
-      (init as ExtendedRequestInit)._ogBody = new TextDecoder("utf-8", {
-        ignoreBOM: true,
-      }).decode(bytes);
+      (init as ExtendedRequestInit)._ogBody = decoder.decode(bytes);
       pushBodyBytes(bytes);
     } else if (probeContentType !== undefined) {
       throw new SkipCacheKeyGenerationError();
@@ -637,6 +635,11 @@ async function buildFetchCacheKey(
   input: string | URL | Request,
   init?: RequestInit & { next?: NextFetchOptions },
 ): Promise<string> {
+  // Reading the body can run user code (toString(), iterators) that changes
+  // the URL or headers, so read them afterwards, as the real fetch sees them.
+  const { bodyChunks, canonicalizedContentType, defaultContentType, bodyMetadata } =
+    await serializeBody(input, init);
+
   let url: string;
   const inputRequest = input instanceof Request ? input : undefined;
 
@@ -651,8 +654,6 @@ async function buildFetchCacheKey(
   const method = normalizeFetchMethod(init?.method ?? inputRequest?.method ?? "GET");
 
   const headers = collectHeaders(input, init);
-  const { bodyChunks, canonicalizedContentType, defaultContentType, bodyMetadata } =
-    await serializeBody(input, init);
   if (canonicalizedContentType) {
     headers["content-type"] = canonicalizedContentType;
   } else if (defaultContentType && headers["content-type"] === undefined) {

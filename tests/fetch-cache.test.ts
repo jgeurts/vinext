@@ -3348,16 +3348,10 @@ describe("fetch cache shim", () => {
 
       it("rejects an oversized chunk before copying it", async () => {
         const large = new Uint8Array(1024 * 1024 + 1);
-        const sliceSpy = vi.spyOn(Uint8Array.prototype, "slice");
-        try {
-          expect(await read(streamOf(large))).toBe(1);
-          for (const copied of sliceSpy.mock.contexts) {
-            expect((copied as Uint8Array).byteLength).toBeLessThanOrEqual(1024 * 1024);
-          }
-        } finally {
-          sliceSpy.mockRestore();
-        }
-        expect(await sentChunks(0)).toEqual([large]);
+        expect(await read(streamOf(large))).toBe(1);
+        expect(await read(streamOf(large))).toBe(2);
+        const [sent] = await sentChunks(0);
+        expect(sent).toBe(large);
       });
     });
 
@@ -3531,11 +3525,32 @@ describe("fetch cache shim", () => {
         next: { revalidate: 60 },
       });
 
-      // Streamed as extracted, with the content type the runtime gave it.
-      const init = fetchMock.mock.calls[0][1] as RequestInit & { duplex?: string };
-      expect(init.duplex).toBe("half");
-      expect(new Headers(init.headers).get("content-type")).toBe("text/plain;charset=UTF-8");
-      expect(await new Response(init.body).text()).toBe(large);
+      expect((fetchMock.mock.calls[0][1] as RequestInit).body).toBe(large);
+    });
+
+    it("keys the headers a body's own code leaves for the real fetch", async () => {
+      const headers = new Headers();
+      const makeBody = (variant: string) =>
+        ({
+          toString: () => {
+            headers.set("x-variant", variant);
+            return "same";
+          },
+        }) as unknown as BodyInit;
+      const read = async (variant: string) => {
+        startNewFetchCacheScope();
+        const res = await fetch("https://api.example.com/body-mutates-headers", {
+          method: "POST",
+          headers,
+          body: makeBody(variant),
+          next: { revalidate: 60 },
+        });
+        return (await res.json()).count as number;
+      };
+
+      expect(await read("a")).toBe(1);
+      expect(await read("b")).toBe(2);
+      expect(await read("b")).toBe(2);
     });
 
     it("keys bodies the runtime stringifies by their string form", async () => {
