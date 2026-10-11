@@ -1386,12 +1386,18 @@ function createPatchedFetch(): typeof globalThis.fetch {
 
     const softTags = _getState().currentFetchSoftTags;
     let fetchInit = stripNextFromInit(init, cacheDirective);
-    if (fetchInit?.body !== undefined && fetchInit.body !== null) {
+    if (
+      (fetchInit?.body !== undefined && fetchInit.body !== null) ||
+      (input instanceof Request && input.body)
+    ) {
       // Reading the body for the key can run its own code (toString(),
       // iterators, stream sources). Like fetch, take the target and headers
       // before that code runs, and key and send that snapshot.
-      if (input instanceof URL) input = input.href;
-      fetchInit.headers = new Headers(getEffectiveRequestHeaders(input, fetchInit));
+      if (input instanceof URL) input = String(input);
+      fetchInit = {
+        ...fetchInit,
+        headers: new Headers(getEffectiveRequestHeaders(input, fetchInit)),
+      };
     }
     let cacheKey: string;
     try {

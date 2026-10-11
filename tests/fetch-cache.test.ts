@@ -3603,6 +3603,53 @@ describe("fetch cache shim", () => {
       expect(fetchMock.mock.calls[0][0]).toBe("https://api.example.com/body-mutates-url/a");
     });
 
+    it("targets a URL through its own string conversion, like fetch", async () => {
+      class RedirectedURL extends URL {
+        override toString() {
+          return "https://api.example.com/url-to-string/b";
+        }
+      }
+
+      await fetch(new RedirectedURL("https://api.example.com/url-to-string/a"), {
+        method: "POST",
+        body: "same",
+        next: { revalidate: 60 },
+      });
+
+      expect(fetchMock.mock.calls[0][0]).toBe("https://api.example.com/url-to-string/b");
+    });
+
+    it("keys and sends a Request's headers from before its body code runs", async () => {
+      const read = async (variant: string) => {
+        startNewFetchCacheScope();
+        let request: Request;
+        const body = new ReadableStream<Uint8Array>(
+          {
+            pull(controller) {
+              request.headers.set("x-variant", variant);
+              controller.enqueue(new TextEncoder().encode("same"));
+              controller.close();
+            },
+          },
+          { highWaterMark: 0 },
+        );
+        request = new Request("https://api.example.com/request-body-mutates-headers", {
+          method: "POST",
+          headers: { "x-variant": "a" },
+          body,
+          duplex: "half",
+        } as RequestInit);
+        const res = await fetch(request, { next: { revalidate: 60 } });
+        return (await res.json()).count as number;
+      };
+
+      expect(await read("b")).toBe(1);
+      const sent = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
+      expect(sent.get("x-variant")).toBe("a");
+      expect(await read("c")).toBe(1);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
     it("keys bodies the runtime stringifies by their string form", async () => {
       const makeBody = (value: string) => ({ toString: () => value }) as unknown as BodyInit;
       // Stringifying this body again would give a different string.
