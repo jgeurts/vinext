@@ -3471,6 +3471,22 @@ describe("fetch cache shim", () => {
         expect(fetchMock).toHaveBeenCalledTimes(1);
       });
 
+      it("sends the keyed body even if body code edits the caller's init", async () => {
+        const init = {
+          method: "POST",
+          duplex: "half",
+          next: { revalidate: 60 },
+        } as RequestInit & { _ogBody?: unknown };
+        init.body = (async function* () {
+          init._ogBody = "B";
+          yield new TextEncoder().encode("A");
+        })() as unknown as BodyInit;
+
+        await fetch("https://api.example.com/body-iterable-edits-init", init);
+
+        expect(await readSentBody(0)).toBe("A");
+      });
+
       it("skips the cache for an oversized iterable body and still sends all of it", async () => {
         const size = 1024 * 1024 + 1;
         async function* largeBody() {
