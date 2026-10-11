@@ -3251,150 +3251,96 @@ describe("fetch cache shim", () => {
       expect((await res2.json()).count).toBe(2);
       expect(fetchMock).toHaveBeenCalledTimes(2);
     });
-    // Workers streams built from iterables hand back each chunk as yielded.
-    it("keys stream chunks by the bytes of every buffer type", async () => {
-      const makeStream = (text: string) => {
-        const bytes = new TextEncoder().encode(text);
-        return new ReadableStream<unknown>({
-          start(controller) {
-            controller.enqueue(bytes.slice(0, 2).buffer);
-            controller.enqueue(new DataView(bytes.slice(2, 4).buffer));
-            controller.enqueue(Uint16Array.from([bytes[4] | (bytes[5] << 8)]));
-            controller.close();
-          },
-        }) as ReadableStream<Uint8Array>;
-      };
-      const read = async (body: BodyInit) => {
-        startNewFetchCacheScope();
-        const res = await fetch("https://api.example.com/body-stream-buffers", {
-          method: "POST",
-          body,
-          next: { revalidate: 60 },
-        });
-        return (await res.json()).count as number;
-      };
-
-      expect(await read(makeStream("abcdef"))).toBe(1);
-      expect(await read(makeStream("abcdeg"))).toBe(2);
-      expect(await read(makeStream("abcdef"))).toBe(1);
-      expect(fetchMock).toHaveBeenCalledTimes(2);
-    });
-
-    // Node rejects a stream body with non-Uint8Array chunks, so it must not be
-    // answered from a valid body's entry.
-    it("keys stream chunks of other types apart from the same bytes", async () => {
-      const bytes = new TextEncoder().encode("same");
-      const makeStream = (chunk: unknown) =>
-        new ReadableStream<unknown>({
-          start(controller) {
-            controller.enqueue(chunk);
-            controller.close();
-          },
-        }) as ReadableStream<Uint8Array>;
-      const read = async (body: BodyInit) => {
-        startNewFetchCacheScope();
-        const res = await fetch("https://api.example.com/body-stream-chunk-types", {
-          method: "POST",
-          body,
-          next: { revalidate: 60 },
-        });
-        return (await res.json()).count as number;
-      };
-
-      expect(await read(bytes)).toBe(1);
-      expect(await read(makeStream(bytes.slice()))).toBe(1);
-      expect(await read(makeStream(bytes.slice().buffer))).toBe(2);
-      expect(await read(makeStream("same"))).toBe(3);
-      expect(await read(makeStream(new DataView(bytes.slice().buffer)))).toBe(4);
-      expect(fetchMock).toHaveBeenCalledTimes(4);
-    });
-
-    it("keys stream chunks by their real type, whatever they claim to be", async () => {
-      const bytes = new TextEncoder().encode("same");
-      const makeStream = (chunk: unknown) =>
-        new ReadableStream<unknown>({
-          start(controller) {
-            controller.enqueue(chunk);
-            controller.close();
-          },
-        }) as ReadableStream<Uint8Array>;
-      const taggedView = (tag: string) =>
-        Object.defineProperty(new DataView(bytes.slice().buffer), Symbol.toStringTag, {
-          value: tag,
-        });
-      const read = async (body: BodyInit) => {
-        startNewFetchCacheScope();
-        const res = await fetch("https://api.example.com/body-stream-tagged", {
-          method: "POST",
-          body,
-          next: { revalidate: 60 },
-        });
-        return (await res.json()).count as number;
-      };
-
-      expect(await read(makeStream(bytes.slice().buffer))).toBe(1);
-      expect(await read(makeStream(taggedView("ArrayBuffer")))).toBe(2);
-      expect(await read(makeStream(taggedView("x".repeat(1024 * 1024))))).toBe(2);
-      expect(fetchMock).toHaveBeenCalledTimes(2);
-    });
-
-    it("keys stream chunks by their real bytes, whatever their accessors return", async () => {
+    describe("stream chunk types", () => {
       const encode = (text: string) => new TextEncoder().encode(text);
-      const makeStream = (chunk: unknown) =>
+      const streamOf = (...chunks: unknown[]) =>
         new ReadableStream<unknown>({
           start(controller) {
-            controller.enqueue(chunk);
+            for (const chunk of chunks) controller.enqueue(chunk);
             controller.close();
           },
         }) as ReadableStream<Uint8Array>;
-      const lying = <T extends object>(view: T, buffer: ArrayBuffer) =>
-        Object.defineProperties(view, {
-          buffer: { get: () => buffer },
-          byteOffset: { get: () => 0 },
-          byteLength: { get: () => buffer.byteLength },
-        });
       const read = async (body: BodyInit) => {
         startNewFetchCacheScope();
-        const res = await fetch("https://api.example.com/body-stream-accessors", {
+        const res = await fetch("https://api.example.com/body-stream-chunks", {
           method: "POST",
           body,
           next: { revalidate: 60 },
         });
         return (await res.json()).count as number;
       };
+      const sentChunks = async (callIndex: number): Promise<unknown[]> => {
+        const body = (fetchMock.mock.calls[callIndex][1] as RequestInit).body as ReadableStream;
+        const chunks: unknown[] = [];
+        for await (const chunk of body as unknown as AsyncIterable<unknown>) chunks.push(chunk);
+        return chunks;
+      };
 
-      expect(await read(makeStream(new DataView(encode("BBBB").buffer)))).toBe(1);
-      expect(
-        await read(makeStream(lying(new DataView(encode("AAAA").buffer), encode("BBBB").buffer))),
-      ).toBe(2);
-      expect(await read(makeStream(encode("BBBB")))).toBe(3);
-      expect(await read(makeStream(lying(encode("AAAA"), encode("BBBB").buffer)))).toBe(4);
-      expect(fetchMock).toHaveBeenCalledTimes(4);
-    });
+      it("keys Uint8Array and string chunks apart from each other", async () => {
+        expect(await read(encode("same"))).toBe(1);
+        expect(await read(streamOf(encode("sa"), encode("me")))).toBe(1);
+        expect(await read(streamOf("same"))).toBe(2);
+        expect(await read(streamOf("sa", "me"))).toBe(2);
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+      });
 
-    it("skips the cache for a stream chunk that is not bytes or text", async () => {
-      const makeStream = () =>
-        new ReadableStream<unknown>({
-          start(controller) {
-            controller.enqueue(42);
-            controller.close();
+      // Runtimes differ in which other chunk types they send or reject (Node
+      // rejects ArrayBuffer chunks), so such a body is fetched as it is.
+      it("skips the cache for other chunk types and sends them unchanged", async () => {
+        const arrayBuffer = encode("ab").buffer;
+        const dataView = new DataView(encode("cd").buffer);
+        const uint16 = Uint16Array.of(0x6665);
+        const notUint8 = Object.defineProperty(
+          new DataView(encode("same").buffer),
+          Symbol.toStringTag,
+          {
+            value: "Uint8Array",
           },
-        }) as ReadableStream<Uint8Array>;
+        );
 
-      await fetch("https://api.example.com/body-stream-number", {
-        method: "POST",
-        body: makeStream(),
-        next: { revalidate: 60 },
-      });
-      startNewFetchCacheScope();
-      await fetch("https://api.example.com/body-stream-number", {
-        method: "POST",
-        body: makeStream(),
-        next: { revalidate: 60 },
+        expect(await read(streamOf(encode("x"), arrayBuffer, dataView, uint16))).toBe(1);
+        expect(await read(streamOf(notUint8))).toBe(2);
+        expect(await read(streamOf(notUint8))).toBe(3);
+        expect(await read(streamOf(42))).toBe(4);
+
+        const [first, ...rest] = await sentChunks(0);
+        expect(new TextDecoder().decode(first as Uint8Array)).toBe("x");
+        expect(rest).toEqual([arrayBuffer, dataView, uint16]);
+        expect(rest[0]).toBe(arrayBuffer);
+        expect(await sentChunks(1)).toEqual([notUint8]);
       });
 
-      expect(fetchMock).toHaveBeenCalledTimes(2);
-      expect((fetchMock.mock.calls[0][1] as RequestInit).body).toBeInstanceOf(ReadableStream);
+      it("keys and sends the real bytes of a Uint8Array chunk", async () => {
+        const claimed = encode("BBBB").buffer;
+        const lying = Object.defineProperties(encode("AAAA"), {
+          [Symbol.toStringTag]: { value: "x".repeat(1024 * 1024) },
+          buffer: { get: () => claimed },
+          byteOffset: { get: () => 0 },
+          byteLength: { get: () => claimed.byteLength },
+        });
+
+        expect(await read(encode("BBBB"))).toBe(1);
+        expect(await read(streamOf(lying))).toBe(2);
+        expect(await read(encode("AAAA"))).toBe(2);
+
+        const [sent] = await sentChunks(1);
+        expect(new TextDecoder().decode(sent as Uint8Array)).toBe("AAAA");
+        expect(sent).not.toBe(lying);
+      });
+
+      it("rejects an oversized chunk before copying it", async () => {
+        const large = new Uint8Array(1024 * 1024 + 1);
+        const sliceSpy = vi.spyOn(Uint8Array.prototype, "slice");
+        try {
+          expect(await read(streamOf(large))).toBe(1);
+          for (const copied of sliceSpy.mock.contexts) {
+            expect((copied as Uint8Array).byteLength).toBeLessThanOrEqual(1024 * 1024);
+          }
+        } finally {
+          sliceSpy.mockRestore();
+        }
+        expect(await sentChunks(0)).toEqual([large]);
+      });
     });
 
     // Runtimes such as Workers and Node send async iterable bodies, so the

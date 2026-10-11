@@ -277,70 +277,68 @@ async function readRequestBodyChunksWithinLimit(
   return { chunks, contentType };
 }
 
-type BodyStreamPart = { kind: string; bytes: Uint8Array };
+type BodyStreamPart = { kind: "bytes" | "string"; bytes: Uint8Array };
 
-// Native accessors read internal slots, so a chunk cannot fake its type or
-// show the key different bytes from the ones the runtime sends.
+// Native accessors read internal slots, so a chunk cannot fake being a
+// Uint8Array or show the key other bytes than its copy that is sent.
 /* oxlint-disable typescript/unbound-method */
 const nativeGetter = (target: object, key: PropertyKey) =>
   Object.getOwnPropertyDescriptor(target, key)!.get!;
 const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
 const typedArrayName = nativeGetter(typedArrayPrototype, Symbol.toStringTag);
-const arrayBufferByteLength = nativeGetter(ArrayBuffer.prototype, "byteLength");
-const typedArrayView = {
-  buffer: nativeGetter(typedArrayPrototype, "buffer"),
-  byteOffset: nativeGetter(typedArrayPrototype, "byteOffset"),
-  byteLength: nativeGetter(typedArrayPrototype, "byteLength"),
-};
-const dataViewView = {
-  buffer: nativeGetter(DataView.prototype, "buffer"),
-  byteOffset: nativeGetter(DataView.prototype, "byteOffset"),
-  byteLength: nativeGetter(DataView.prototype, "byteLength"),
-};
+const typedArrayBuffer = nativeGetter(typedArrayPrototype, "buffer");
+const typedArrayByteOffset = nativeGetter(typedArrayPrototype, "byteOffset");
+const typedArrayByteLength = nativeGetter(typedArrayPrototype, "byteLength");
 /* oxlint-enable typescript/unbound-method */
 
-function isArrayBuffer(value: unknown): value is ArrayBuffer {
-  try {
-    arrayBufferByteLength.call(value);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// Workers streams built from iterables yield chunks as given, and runtimes
-// differ in which chunk types they send or reject (Node rejects ArrayBuffer
-// chunks). Key other chunks by their type too, so a body one runtime rejects
-// never shares a key with a valid body.
-function bodyChunkToPart(chunk: unknown, encoder: TextEncoder): BodyStreamPart {
-  if (typeof chunk === "string") return { kind: "string", bytes: encoder.encode(chunk) };
-  if (ArrayBuffer.isView(chunk)) {
-    const name: unknown = typedArrayName.call(chunk);
-    const view = name === undefined ? dataViewView : typedArrayView;
-    // Copy the bytes, so the key keeps what was read here.
-    const bytes = new Uint8Array(
-      view.buffer.call(chunk) as ArrayBuffer,
-      view.byteOffset.call(chunk) as number,
-      view.byteLength.call(chunk) as number,
-    ).slice();
-    if (name === "Uint8Array") return { kind: "bytes", bytes };
-    return { kind: name === undefined ? "DataView" : "TypedArray", bytes };
-  }
-  if (isArrayBuffer(chunk)) return { kind: "ArrayBuffer", bytes: new Uint8Array(chunk).slice() };
-  throw new SkipCacheKeyGenerationError();
+/** Send the chunks already read, then the rest of the source. */
+function replayBodyStream(
+  readChunks: unknown[],
+  reader: ReadableStreamDefaultReader<unknown>,
+): ReadableStream<Uint8Array> {
+  let next = 0;
+  return new ReadableStream<unknown>(
+    {
+      async pull(controller) {
+        if (next < readChunks.length) {
+          controller.enqueue(readChunks[next++]);
+          return;
+        }
+        try {
+          const { done, value } = await reader.read();
+          if (done) controller.close();
+          else controller.enqueue(value);
+        } catch (err) {
+          controller.error(err);
+        }
+      },
+      cancel(reason) {
+        return reader.cancel(reason);
+      },
+      // Pull only once the fetch reads, never while the key is being read.
+    },
+    { highWaterMark: 0 },
+  ) as ReadableStream<Uint8Array>;
 }
 
 /**
- * Read a body stream for the cache key. Consecutive chunks of the same type
- * are merged, so chunk boundaries never affect the key.
+ * Read a body stream for the cache key. `setBody` receives the stream the
+ * real fetch sends instead: copies of the chunks that were keyed, followed by
+ * whatever was not read. Only Uint8Array and string chunks are keyed, as
+ * runtimes differ in which other chunk types they send or reject; any other
+ * chunk skips the cache. Consecutive chunks of the same type are merged, so
+ * chunk boundaries never affect the key.
  */
-async function readBodyStreamWithinLimit(
+async function readBodyStreamForCacheKey(
   stream: ReadableStream<unknown>,
   signal: AbortSignal | null | undefined,
+  setBody: (body: ReadableStream<Uint8Array>) => void,
 ): Promise<BodyStreamPart[]> {
   const encoder = new TextEncoder();
   const reader = stream.getReader();
-  const parts: { kind: string; chunks: Uint8Array[] }[] = [];
+  const readChunks: unknown[] = [];
+  setBody(replayBodyStream(readChunks, reader));
+  const parts: { kind: BodyStreamPart["kind"]; chunks: Uint8Array[] }[] = [];
   let totalBodyBytes = 0;
   // An abort must reach the real fetch even while a body source stalls, so
   // stop reading and let the fallback fetch observe the aborted signal.
@@ -353,7 +351,37 @@ async function readBodyStreamWithinLimit(
       const { done, value } = await reader.read();
       if (signal?.aborted) throw new SkipCacheKeyGenerationError();
       if (done) break;
-      const { kind, bytes } = bodyChunkToPart(value, encoder);
+
+      const remainingBytes = MAX_CACHE_KEY_BODY_BYTES - totalBodyBytes;
+      let kind: BodyStreamPart["kind"];
+      let bytes: Uint8Array;
+      if (typeof value === "string") {
+        // String length is a lower bound on its UTF-8 byte length.
+        if (value.length > remainingBytes) {
+          readChunks.push(value);
+          throw new BodyTooLargeForCacheKeyError();
+        }
+        kind = "string";
+        bytes = encoder.encode(value);
+        readChunks.push(value);
+      } else if (ArrayBuffer.isView(value) && typedArrayName.call(value) === "Uint8Array") {
+        const byteLength = typedArrayByteLength.call(value) as number;
+        if (byteLength > remainingBytes) {
+          readChunks.push(value);
+          throw new BodyTooLargeForCacheKeyError();
+        }
+        kind = "bytes";
+        bytes = new Uint8Array(
+          typedArrayBuffer.call(value) as ArrayBuffer,
+          typedArrayByteOffset.call(value) as number,
+          byteLength,
+        ).slice();
+        readChunks.push(bytes);
+      } else {
+        readChunks.push(value);
+        throw new SkipCacheKeyGenerationError();
+      }
+
       totalBodyBytes += bytes.byteLength;
       if (totalBodyBytes > MAX_CACHE_KEY_BODY_BYTES) {
         throw new BodyTooLargeForCacheKeyError();
@@ -366,9 +394,6 @@ async function readBodyStreamWithinLimit(
       }
     }
   } catch (err) {
-    // Do not await cancellation of one tee branch: it may not settle until
-    // the fallback fetch starts consuming the other branch.
-    void reader.cancel().catch(() => {});
     if (err instanceof BodyTooLargeForCacheKeyError) {
       throw err;
     }
@@ -441,10 +466,12 @@ async function serializeBody(
     (init as ExtendedRequestInit)._ogBody = init.body;
   } else if (init?.body && typeof (init.body as { getReader?: unknown }).getReader === "function") {
     // ReadableStream
-    const readableBody = init.body as ReadableStream<Uint8Array | string>;
-    const [bodyForHashing, bodyForFetch] = readableBody.tee();
-    (init as ExtendedRequestInit)._ogBody = bodyForFetch;
-    pushBodyStreamParts(await readBodyStreamWithinLimit(bodyForHashing, signal));
+    const readableBody = init.body as ReadableStream<unknown>;
+    pushBodyStreamParts(
+      await readBodyStreamForCacheKey(readableBody, signal, (body) => {
+        (init as ExtendedRequestInit)._ogBody = body;
+      }),
+    );
   } else if (init?.body instanceof URLSearchParams) {
     // URLSearchParams — .toString() gives a stable serialization
     (init as ExtendedRequestInit)._ogBody = init.body;
@@ -524,11 +551,13 @@ async function serializeBody(
     } else if (probeContentType !== undefined) {
       throw new SkipCacheKeyGenerationError();
     } else {
-      // Iterating the body may have consumed it, so the real fetch sends the
-      // other branch of what was read here.
-      const [bodyForHashing, bodyForFetch] = probeBody.tee();
-      (init as ExtendedRequestInit)._ogBody = bodyForFetch;
-      pushBodyStreamParts(await readBodyStreamWithinLimit(bodyForHashing, signal));
+      // Iterating the body may have consumed it, so the real fetch sends what
+      // was read here.
+      pushBodyStreamParts(
+        await readBodyStreamForCacheKey(probeBody, signal, (body) => {
+          (init as ExtendedRequestInit)._ogBody = body;
+        }),
+      );
     }
   } else if (input instanceof Request && input.body) {
     let chunks: Uint8Array[];

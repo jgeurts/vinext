@@ -2,8 +2,7 @@ export const dynamic = "force-dynamic";
 
 async function* jsonBody(value: unknown) {
   const bytes = new TextEncoder().encode(JSON.stringify(value));
-  // Workers hands ArrayBuffer chunks back unconverted, unlike Uint8Array ones.
-  yield bytes.slice(0, 8).buffer;
+  yield bytes.slice(0, 8);
   yield bytes.slice(8);
 }
 
