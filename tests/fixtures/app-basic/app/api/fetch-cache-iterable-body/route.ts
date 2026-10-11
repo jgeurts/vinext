@@ -1,7 +1,10 @@
 export const dynamic = "force-dynamic";
 
 async function* jsonBody(value: unknown) {
-  yield new TextEncoder().encode(JSON.stringify(value));
+  const bytes = new TextEncoder().encode(JSON.stringify(value));
+  // Workers hands ArrayBuffer chunks back unconverted, unlike Uint8Array ones.
+  yield bytes.slice(0, 8).buffer;
+  yield bytes.slice(8);
 }
 
 // Cached POSTs that differ only in their async iterable body must not share a

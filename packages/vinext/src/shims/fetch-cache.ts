@@ -277,9 +277,18 @@ async function readRequestBodyChunksWithinLimit(
   return { chunks, contentType };
 }
 
-async function readBodyStreamWithinLimit(
-  stream: ReadableStream<Uint8Array | string>,
-): Promise<Uint8Array> {
+// Workers streams built from iterables yield chunks as given, so convert them
+// the way the runtime does when it sends them.
+function bodyChunkToBytes(chunk: unknown, encoder: TextEncoder): Uint8Array {
+  if (typeof chunk === "string") return encoder.encode(chunk);
+  if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
+  if (ArrayBuffer.isView(chunk)) {
+    return new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+  }
+  throw new SkipCacheKeyGenerationError();
+}
+
+async function readBodyStreamWithinLimit(stream: ReadableStream<unknown>): Promise<Uint8Array> {
   const encoder = new TextEncoder();
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
@@ -289,7 +298,7 @@ async function readBodyStreamWithinLimit(
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      const bytes = typeof value === "string" ? encoder.encode(value) : value;
+      const bytes = bodyChunkToBytes(value, encoder);
       totalBodyBytes += bytes.byteLength;
       if (totalBodyBytes > MAX_CACHE_KEY_BODY_BYTES) {
         throw new BodyTooLargeForCacheKeyError();

@@ -3251,6 +3251,70 @@ describe("fetch cache shim", () => {
       expect((await res2.json()).count).toBe(2);
       expect(fetchMock).toHaveBeenCalledTimes(2);
     });
+    // Workers streams built from iterables hand back each chunk as yielded.
+    it("keys stream chunks by the bytes of every buffer type", async () => {
+      const makeStream = (text: string) => {
+        const bytes = new TextEncoder().encode(text);
+        return new ReadableStream<unknown>({
+          start(controller) {
+            controller.enqueue(bytes.slice(0, 2).buffer);
+            controller.enqueue(new DataView(bytes.slice(2, 4).buffer));
+            controller.enqueue(Uint16Array.from([bytes[4] | (bytes[5] << 8)]));
+            controller.close();
+          },
+        }) as ReadableStream<Uint8Array>;
+      };
+
+      const res1 = await fetch("https://api.example.com/body-stream-buffers", {
+        method: "POST",
+        body: makeStream("abcdef"),
+        next: { revalidate: 60 },
+      });
+      expect((await res1.json()).count).toBe(1);
+
+      startNewFetchCacheScope();
+      const res2 = await fetch("https://api.example.com/body-stream-buffers", {
+        method: "POST",
+        body: makeStream("abcdeg"),
+        next: { revalidate: 60 },
+      });
+      expect((await res2.json()).count).toBe(2);
+
+      startNewFetchCacheScope();
+      const res3 = await fetch("https://api.example.com/body-stream-buffers", {
+        method: "POST",
+        body: new TextEncoder().encode("abcdef"),
+        next: { revalidate: 60 },
+      });
+      expect((await res3.json()).count).toBe(1);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("skips the cache for a stream chunk that is not bytes or text", async () => {
+      const makeStream = () =>
+        new ReadableStream<unknown>({
+          start(controller) {
+            controller.enqueue(42);
+            controller.close();
+          },
+        }) as ReadableStream<Uint8Array>;
+
+      await fetch("https://api.example.com/body-stream-number", {
+        method: "POST",
+        body: makeStream(),
+        next: { revalidate: 60 },
+      });
+      startNewFetchCacheScope();
+      await fetch("https://api.example.com/body-stream-number", {
+        method: "POST",
+        body: makeStream(),
+        next: { revalidate: 60 },
+      });
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect((fetchMock.mock.calls[0][1] as RequestInit).body).toBeInstanceOf(ReadableStream);
+    });
+
     // Runtimes such as Workers and Node send async iterable bodies, so the
     // bytes they yield must reach the key.
     describe("async iterable bodies", () => {
@@ -3326,6 +3390,8 @@ describe("fetch cache shim", () => {
         } as RequestInit);
 
         expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(await readSentBody(0)).toBe("first");
+        expect(await readSentBody(1)).toBe("second");
       });
 
       it("skips the cache for an oversized iterable body and still sends all of it", async () => {
