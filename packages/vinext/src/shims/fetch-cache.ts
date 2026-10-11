@@ -455,11 +455,14 @@ async function serializeBody(
       defaultContentType = probeContentType;
     }
     if (probeContentType?.toLowerCase() === "text/plain;charset=utf-8") {
-      // The runtime stringified the body. Send the string that was keyed, as
-      // stringifying the original again may not give the same result.
-      const bytes = await readBodyStreamWithinLimit(probeBody, signal);
+      // The runtime stringified the body. Send that string even when it is too
+      // large to key, as stringifying the original again may not give the same
+      // result.
+      const bytes = new Uint8Array(await probe.arrayBuffer());
+      (init as ExtendedRequestInit)._ogBody = new TextDecoder("utf-8", {
+        ignoreBOM: true,
+      }).decode(bytes);
       pushBodyBytes(bytes);
-      (init as ExtendedRequestInit)._ogBody = new TextDecoder().decode(bytes);
     } else if (probeContentType !== undefined) {
       throw new SkipCacheKeyGenerationError();
     } else {

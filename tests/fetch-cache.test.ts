@@ -3444,6 +3444,30 @@ describe("fetch cache shim", () => {
       });
     });
 
+    it("sends a stringified body with its leading BOM", async () => {
+      await fetch("https://api.example.com/body-stringified-bom", {
+        method: "POST",
+        body: { toString: () => "\uFEFFvalue" } as unknown as BodyInit,
+        next: { revalidate: 60 },
+      });
+
+      expect((fetchMock.mock.calls[0][1] as RequestInit).body).toBe("\uFEFFvalue");
+    });
+
+    it("sends an oversized stringified body as first stringified", async () => {
+      const large = "x".repeat(1024 * 1024 + 1);
+      let stringified = 0;
+      await fetch("https://api.example.com/body-stringified-large", {
+        method: "POST",
+        body: {
+          toString: () => (stringified++ === 0 ? large : "changed"),
+        } as unknown as BodyInit,
+        next: { revalidate: 60 },
+      });
+
+      expect((fetchMock.mock.calls[0][1] as RequestInit).body).toBe(large);
+    });
+
     it("keys bodies the runtime stringifies by their string form", async () => {
       const makeBody = (value: string) => ({ toString: () => value }) as unknown as BodyInit;
       // Stringifying this body again would give a different string.
