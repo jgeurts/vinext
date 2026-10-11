@@ -3253,13 +3253,16 @@ describe("fetch cache shim", () => {
     });
     describe("stream chunk types", () => {
       const encode = (text: string) => new TextEncoder().encode(text);
-      const streamOf = (...chunks: unknown[]) =>
-        new ReadableStream<unknown>({
-          start(controller) {
-            for (const chunk of chunks) controller.enqueue(chunk);
-            controller.close();
+      const streamFrom = (chunks: unknown[]) => {
+        let next = 0;
+        return new ReadableStream<unknown>({
+          pull(controller) {
+            if (next < chunks.length) controller.enqueue(chunks[next++]);
+            else controller.close();
           },
         }) as ReadableStream<Uint8Array>;
+      };
+      const streamOf = (...chunks: unknown[]) => streamFrom(chunks);
       const read = async (body: BodyInit) => {
         startNewFetchCacheScope();
         const res = await fetch("https://api.example.com/body-stream-chunks", {
@@ -3326,6 +3329,21 @@ describe("fetch cache shim", () => {
         const [sent] = await sentChunks(1);
         expect(new TextDecoder().decode(sent as Uint8Array)).toBe("AAAA");
         expect(sent).not.toBe(lying);
+      });
+
+      it("drops empty chunks and counts type tags towards the key size limit", async () => {
+        const empties = Array.from({ length: 50_000 }, (_, i) =>
+          i % 2 === 0 ? "" : new Uint8Array(),
+        );
+        expect(await read(encode("x"))).toBe(1);
+        expect(await read(streamFrom([...empties, encode("x"), ...empties]))).toBe(1);
+
+        // Alternating types add a tag per chunk, which alone exceeds the limit.
+        const alternating = Array.from({ length: 300_000 }, (_, i) =>
+          i % 2 === 0 ? "a" : encode("b"),
+        );
+        expect(await read(streamFrom(alternating))).toBe(2);
+        expect(await read(streamFrom(alternating))).toBe(3);
       });
 
       it("rejects an oversized chunk before copying it", async () => {
@@ -3513,7 +3531,11 @@ describe("fetch cache shim", () => {
         next: { revalidate: 60 },
       });
 
-      expect((fetchMock.mock.calls[0][1] as RequestInit).body).toBe(large);
+      // Streamed as extracted, with the content type the runtime gave it.
+      const init = fetchMock.mock.calls[0][1] as RequestInit & { duplex?: string };
+      expect(init.duplex).toBe("half");
+      expect(new Headers(init.headers).get("content-type")).toBe("text/plain;charset=UTF-8");
+      expect(await new Response(init.body).text()).toBe(large);
     });
 
     it("keys bodies the runtime stringifies by their string form", async () => {

@@ -355,6 +355,7 @@ async function readBodyStreamForCacheKey(
       const remainingBytes = MAX_CACHE_KEY_BODY_BYTES - totalBodyBytes;
       let kind: BodyStreamPart["kind"];
       let bytes: Uint8Array;
+      let sentChunk: unknown;
       if (typeof value === "string") {
         // String length is a lower bound on its UTF-8 byte length.
         if (value.length > remainingBytes) {
@@ -363,7 +364,7 @@ async function readBodyStreamForCacheKey(
         }
         kind = "string";
         bytes = encoder.encode(value);
-        readChunks.push(value);
+        sentChunk = value;
       } else if (ArrayBuffer.isView(value) && typedArrayName.call(value) === "Uint8Array") {
         const byteLength = typedArrayByteLength.call(value) as number;
         if (byteLength > remainingBytes) {
@@ -376,17 +377,21 @@ async function readBodyStreamForCacheKey(
           typedArrayByteOffset.call(value) as number,
           byteLength,
         ).slice();
-        readChunks.push(bytes);
+        sentChunk = bytes;
       } else {
         readChunks.push(value);
         throw new SkipCacheKeyGenerationError();
       }
 
-      totalBodyBytes += bytes.byteLength;
+      // Empty chunks send nothing, so drop them instead of collecting them.
+      if (bytes.byteLength === 0) continue;
+      readChunks.push(sentChunk);
+      const lastPart = parts.at(-1);
+      // A new part also adds its type tag to the key.
+      totalBodyBytes += bytes.byteLength + (lastPart?.kind === kind ? 0 : kind.length + 1);
       if (totalBodyBytes > MAX_CACHE_KEY_BODY_BYTES) {
         throw new BodyTooLargeForCacheKeyError();
       }
-      const lastPart = parts.at(-1);
       if (lastPart?.kind === kind) {
         lastPart.chunks.push(bytes);
       } else {
@@ -540,10 +545,24 @@ async function serializeBody(
       defaultContentType = probeContentType;
     }
     if (probeContentType?.toLowerCase() === "text/plain;charset=utf-8") {
-      // The runtime stringified the body. Send that string even when it is too
-      // large to key, as stringifying the original again may not give the same
-      // result.
-      const bytes = new Uint8Array(await probe.arrayBuffer());
+      // The runtime stringified the body. Send what it extracted, as
+      // stringifying the original again may not give the same result.
+      let parts: BodyStreamPart[];
+      try {
+        parts = await readBodyStreamForCacheKey(probeBody, signal, (body) => {
+          (init as ExtendedRequestInit)._ogBody = body;
+        });
+      } catch (err) {
+        // Too large to key: stream the rest with the type the runtime gave it.
+        (init as RequestInit & { duplex?: string }).duplex = "half";
+        if (!hasEffectiveContentType) {
+          const headers = new Headers(getEffectiveRequestHeaders(input, init));
+          headers.set("content-type", probeContentType);
+          init.headers = headers;
+        }
+        throw err;
+      }
+      const bytes = concatBodyBytes(parts.map((part) => part.bytes));
       (init as ExtendedRequestInit)._ogBody = new TextDecoder("utf-8", {
         ignoreBOM: true,
       }).decode(bytes);
