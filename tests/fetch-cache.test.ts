@@ -3251,6 +3251,136 @@ describe("fetch cache shim", () => {
       expect((await res2.json()).count).toBe(2);
       expect(fetchMock).toHaveBeenCalledTimes(2);
     });
+    // Runtimes such as Workers and Node send async iterable bodies, so the
+    // bytes they yield must reach the key.
+    describe("async iterable bodies", () => {
+      async function* iterableBody(...chunks: string[]) {
+        for (const chunk of chunks) yield new TextEncoder().encode(chunk);
+      }
+
+      async function readSentBody(callIndex: number): Promise<string> {
+        const init = fetchMock.mock.calls[callIndex][1] as RequestInit;
+        return new Response(init.body).text();
+      }
+
+      it("keys different iterable bodies separately and sends each body", async () => {
+        const res1 = await fetch("https://api.example.com/body-iterable", {
+          method: "POST",
+          body: iterableBody('{"visibility":', '"private"}') as unknown as BodyInit,
+          duplex: "half",
+          next: { revalidate: 60 },
+        } as RequestInit);
+        expect((await res1.json()).count).toBe(1);
+
+        startNewFetchCacheScope();
+        const res2 = await fetch("https://api.example.com/body-iterable", {
+          method: "POST",
+          body: iterableBody('{"visibility":', '"public"}') as unknown as BodyInit,
+          duplex: "half",
+          next: { revalidate: 60 },
+        } as RequestInit);
+        expect((await res2.json()).count).toBe(2);
+
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(await readSentBody(0)).toBe('{"visibility":"private"}');
+        expect(await readSentBody(1)).toBe('{"visibility":"public"}');
+      });
+
+      it("still caches an iterable body that repeats the same bytes", async () => {
+        const res1 = await fetch("https://api.example.com/body-iterable-repeat", {
+          method: "POST",
+          body: iterableBody("same") as unknown as BodyInit,
+          duplex: "half",
+          next: { revalidate: 60 },
+        } as RequestInit);
+        expect((await res1.json()).count).toBe(1);
+
+        startNewFetchCacheScope();
+        const res2 = await fetch("https://api.example.com/body-iterable-repeat", {
+          method: "POST",
+          body: iterableBody("sa", "me") as unknown as BodyInit,
+          duplex: "half",
+          next: { revalidate: 60 },
+        } as RequestInit);
+        expect((await res2.json()).count).toBe(1);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+      });
+
+      it("keys a Request input by the iterable init body that replaces its body", async () => {
+        const makeInput = () =>
+          new Request("https://api.example.com/body-iterable-request", {
+            method: "POST",
+            body: "request-body",
+          });
+
+        await fetch(makeInput(), {
+          body: iterableBody("first") as unknown as BodyInit,
+          duplex: "half",
+          next: { revalidate: 60 },
+        } as RequestInit);
+        startNewFetchCacheScope();
+        await fetch(makeInput(), {
+          body: iterableBody("second") as unknown as BodyInit,
+          duplex: "half",
+          next: { revalidate: 60 },
+        } as RequestInit);
+
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+      });
+
+      it("skips the cache for an oversized iterable body and still sends all of it", async () => {
+        const size = 1024 * 1024 + 1;
+        async function* largeBody() {
+          yield new Uint8Array(size - 1);
+          yield Uint8Array.of(0x2a);
+        }
+
+        await fetch("https://api.example.com/body-iterable-large", {
+          method: "POST",
+          body: largeBody() as unknown as BodyInit,
+          duplex: "half",
+          next: { revalidate: 60 },
+        } as RequestInit);
+
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        const init = fetchMock.mock.calls[0][1] as RequestInit & { duplex?: string };
+        expect(init.duplex).toBe("half");
+        const sent = new Uint8Array(await new Response(init.body).arrayBuffer());
+        expect(sent.byteLength).toBe(size);
+        expect(sent[size - 1]).toBe(0x2a);
+      });
+    });
+
+    it("keys bodies the runtime stringifies by their string form", async () => {
+      const makeBody = (value: string) => ({ toString: () => value }) as unknown as BodyInit;
+      const firstBody = makeBody("first");
+
+      const res1 = await fetch("https://api.example.com/body-stringified", {
+        method: "POST",
+        body: firstBody,
+        next: { revalidate: 60 },
+      });
+      expect((await res1.json()).count).toBe(1);
+      startNewFetchCacheScope();
+      const res2 = await fetch("https://api.example.com/body-stringified", {
+        method: "POST",
+        body: makeBody("second"),
+        next: { revalidate: 60 },
+      });
+      expect((await res2.json()).count).toBe(2);
+      startNewFetchCacheScope();
+      // The stringified body is keyed like the equivalent string body.
+      const res3 = await fetch("https://api.example.com/body-stringified", {
+        method: "POST",
+        body: "first",
+        next: { revalidate: 60 },
+      });
+      expect((await res3.json()).count).toBe(1);
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      // The runtime can stringify the original body again, so it is sent as is.
+      expect((fetchMock.mock.calls[0][1] as RequestInit).body).toBe(firstBody);
+    });
   });
 
   // ── Cache key: header inclusion (all headers minus blocklist) ──────

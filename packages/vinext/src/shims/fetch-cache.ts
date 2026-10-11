@@ -277,10 +277,43 @@ async function readRequestBodyChunksWithinLimit(
   return { chunks, contentType };
 }
 
+async function readBodyStreamWithinLimit(
+  stream: ReadableStream<Uint8Array | string>,
+): Promise<Uint8Array> {
+  const encoder = new TextEncoder();
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBodyBytes = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const bytes = typeof value === "string" ? encoder.encode(value) : value;
+      totalBodyBytes += bytes.byteLength;
+      if (totalBodyBytes > MAX_CACHE_KEY_BODY_BYTES) {
+        throw new BodyTooLargeForCacheKeyError();
+      }
+      chunks.push(bytes);
+    }
+  } catch (err) {
+    // Do not await cancellation of one tee branch: it may not settle until
+    // the fallback fetch starts consuming the other branch.
+    void reader.cancel().catch(() => {});
+    if (err instanceof BodyTooLargeForCacheKeyError) {
+      throw err;
+    }
+    throw new SkipCacheKeyGenerationError();
+  }
+
+  return concatBodyBytes(chunks);
+}
+
 /**
  * Serialize request body into string chunks for cache key inclusion.
  * Handles all body types: string, Uint8Array, ReadableStream, FormData, Blob,
- * and Request object bodies.
+ * Request object bodies, and any other body the runtime accepts (e.g. async
+ * iterables), keyed by the bytes the runtime would send.
  * Returns the serialized body chunks and optionally stashes the original body
  * on init as `_ogBody` so it can still be used after stream consumption.
  */
@@ -328,30 +361,7 @@ async function serializeBody(
     const readableBody = init.body as ReadableStream<Uint8Array | string>;
     const [bodyForHashing, bodyForFetch] = readableBody.tee();
     (init as ExtendedRequestInit)._ogBody = bodyForFetch;
-    const reader = bodyForHashing.getReader();
-    const chunks: Uint8Array[] = [];
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const bytes = typeof value === "string" ? encoder.encode(value) : value;
-        totalBodyBytes += bytes.byteLength;
-        if (totalBodyBytes > MAX_CACHE_KEY_BODY_BYTES) {
-          throw new BodyTooLargeForCacheKeyError();
-        }
-        chunks.push(bytes);
-      }
-      bodyChunks.push(encodeBodyBytes(concatBodyBytes(chunks)));
-    } catch (err) {
-      // Do not await cancellation of one tee branch: it may not settle until
-      // the fallback fetch starts consuming the other branch.
-      void reader.cancel().catch(() => {});
-      if (err instanceof BodyTooLargeForCacheKeyError) {
-        throw err;
-      }
-      throw new SkipCacheKeyGenerationError();
-    }
+    pushBodyBytes(await readBodyStreamWithinLimit(bodyForHashing));
   } else if (init?.body instanceof URLSearchParams) {
     // URLSearchParams — .toString() gives a stable serialization
     (init as ExtendedRequestInit)._ogBody = init.body;
@@ -359,7 +369,11 @@ async function serializeBody(
     if (!hasEffectiveContentType) {
       defaultContentType = "application/x-www-form-urlencoded;charset=UTF-8";
     }
-  } else if (init?.body && typeof (init.body as { keys?: unknown }).keys === "function") {
+  } else if (
+    init?.body &&
+    typeof (init.body as { keys?: unknown }).keys === "function" &&
+    typeof (init.body as { getAll?: unknown }).getAll === "function"
+  ) {
     // FormData
     const formData = init.body as FormData;
     (init as ExtendedRequestInit)._ogBody = init.body;
@@ -395,6 +409,47 @@ async function serializeBody(
     (init as ExtendedRequestInit)._ogBody = init.body;
     if (!hasEffectiveContentType) {
       defaultContentType = "text/plain;charset=UTF-8";
+    }
+  } else if (hasInitBody) {
+    // Any other body the runtime accepts: async iterables (and sync ones on
+    // Workers) or values it stringifies. Let the runtime extract the bytes it
+    // will send, so different bodies never share a key.
+    let probe: Request;
+    try {
+      probe = new Request("http://localhost/", {
+        method: "POST",
+        body: init.body,
+        duplex: "half",
+      } as RequestInit);
+    } catch {
+      throw new SkipCacheKeyGenerationError();
+    }
+    const probeBody = probe.body;
+    if (!probeBody) {
+      throw new SkipCacheKeyGenerationError();
+    }
+    const probeContentType = probe.headers.get("content-type") ?? undefined;
+    if (!hasEffectiveContentType) {
+      defaultContentType = probeContentType;
+    }
+    if (probeContentType !== undefined) {
+      // The runtime stringified the body, so the original can be sent again.
+      pushBodyBytes(await readBodyStreamWithinLimit(probeBody));
+    } else {
+      // Iterating the body may have consumed it, so the real fetch must send
+      // the bytes read here instead of the original.
+      const [bodyForHashing, bodyForFetch] = probeBody.tee();
+      let bytes: Uint8Array;
+      try {
+        bytes = await readBodyStreamWithinLimit(bodyForHashing);
+      } catch (err) {
+        (init as ExtendedRequestInit)._ogBody = bodyForFetch;
+        (init as RequestInit & { duplex?: string }).duplex = "half";
+        throw err;
+      }
+      void bodyForFetch.cancel().catch(() => {});
+      pushBodyBytes(bytes);
+      (init as ExtendedRequestInit)._ogBody = bytes as Uint8Array<ArrayBuffer>;
     }
   } else if (input instanceof Request && input.body) {
     let chunks: Uint8Array[];
