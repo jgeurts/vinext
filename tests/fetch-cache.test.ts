@@ -3346,6 +3346,8 @@ describe("fetch cache shim", () => {
         expect((await res2.json()).count).toBe(2);
 
         expect(fetchMock).toHaveBeenCalledTimes(2);
+        // Sent as a stream, as the runtime sends the iterable itself.
+        expect((fetchMock.mock.calls[0][1] as RequestInit).body).toBeInstanceOf(ReadableStream);
         expect(await readSentBody(0)).toBe('{"visibility":"private"}');
         expect(await readSentBody(1)).toBe('{"visibility":"public"}');
       });
@@ -3394,6 +3396,31 @@ describe("fetch cache shim", () => {
         expect(await readSentBody(1)).toBe("second");
       });
 
+      it("lets an abort reach the real fetch while an iterable body stalls", async () => {
+        fetchMock.mockImplementation(async (_input, init) => {
+          init?.signal?.throwIfAborted();
+          return new Response("unexpected");
+        });
+        const controller = new AbortController();
+        async function* stalledBody() {
+          yield new TextEncoder().encode("partial");
+          await new Promise(() => {});
+        }
+
+        const pending = fetch("https://api.example.com/body-iterable-stalled", {
+          method: "POST",
+          body: stalledBody() as unknown as BodyInit,
+          duplex: "half",
+          signal: controller.signal,
+          next: { revalidate: 60 },
+        } as RequestInit);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        controller.abort();
+
+        await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+      });
+
       it("skips the cache for an oversized iterable body and still sends all of it", async () => {
         const size = 1024 * 1024 + 1;
         async function* largeBody() {
@@ -3419,7 +3446,11 @@ describe("fetch cache shim", () => {
 
     it("keys bodies the runtime stringifies by their string form", async () => {
       const makeBody = (value: string) => ({ toString: () => value }) as unknown as BodyInit;
-      const firstBody = makeBody("first");
+      // Stringifying this body again would give a different string.
+      let stringified = 0;
+      const firstBody = {
+        toString: () => (stringified++ === 0 ? "first" : "changed"),
+      } as unknown as BodyInit;
 
       const res1 = await fetch("https://api.example.com/body-stringified", {
         method: "POST",
@@ -3444,8 +3475,8 @@ describe("fetch cache shim", () => {
       expect((await res3.json()).count).toBe(1);
 
       expect(fetchMock).toHaveBeenCalledTimes(2);
-      // The runtime can stringify the original body again, so it is sent as is.
-      expect((fetchMock.mock.calls[0][1] as RequestInit).body).toBe(firstBody);
+      // The string that was keyed is the one sent.
+      expect((fetchMock.mock.calls[0][1] as RequestInit).body).toBe("first");
     });
   });
 

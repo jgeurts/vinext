@@ -58,7 +58,7 @@ export type { FetchCacheMode, FetchCacheState } from "./fetch-cache-state.js";
 const HEADER_BLOCKLIST = ["traceparent", "tracestate"];
 
 // Cache key version — bump when changing the key format to bust stale entries
-const CACHE_KEY_PREFIX = "v5";
+const CACHE_KEY_PREFIX = "v6";
 const MAX_CACHE_KEY_BODY_BYTES = 1024 * 1024; // 1 MiB
 
 // "Cache indefinitely" duration — mirrors upstream's CACHE_ONE_YEAR_SECONDS.
@@ -288,15 +288,24 @@ function bodyChunkToBytes(chunk: unknown, encoder: TextEncoder): Uint8Array {
   throw new SkipCacheKeyGenerationError();
 }
 
-async function readBodyStreamWithinLimit(stream: ReadableStream<unknown>): Promise<Uint8Array> {
+async function readBodyStreamWithinLimit(
+  stream: ReadableStream<unknown>,
+  signal: AbortSignal | null | undefined,
+): Promise<Uint8Array> {
   const encoder = new TextEncoder();
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
   let totalBodyBytes = 0;
+  // An abort must reach the real fetch even while a body source stalls, so
+  // stop reading and let the fallback fetch observe the aborted signal.
+  const cancelOnAbort = () => void reader.cancel().catch(() => {});
+  signal?.addEventListener("abort", cancelOnAbort, { once: true });
 
   try {
     while (true) {
+      if (signal?.aborted) throw new SkipCacheKeyGenerationError();
       const { done, value } = await reader.read();
+      if (signal?.aborted) throw new SkipCacheKeyGenerationError();
       if (done) break;
       const bytes = bodyChunkToBytes(value, encoder);
       totalBodyBytes += bytes.byteLength;
@@ -313,6 +322,8 @@ async function readBodyStreamWithinLimit(stream: ReadableStream<unknown>): Promi
       throw err;
     }
     throw new SkipCacheKeyGenerationError();
+  } finally {
+    signal?.removeEventListener("abort", cancelOnAbort);
   }
 
   return concatBodyBytes(chunks);
@@ -342,6 +353,8 @@ async function serializeBody(
   let defaultContentType: string | undefined;
   let bodyMetadata: string | undefined = "body-present";
   const hasEffectiveContentType = getEffectiveRequestHeaders(input, init).has("content-type");
+  const signal =
+    init?.signal !== undefined ? init.signal : input instanceof Request ? input.signal : undefined;
 
   const pushBodyChunk = (chunk: string, byteLength = encoder.encode(chunk).byteLength): void => {
     totalBodyBytes += byteLength;
@@ -370,7 +383,7 @@ async function serializeBody(
     const readableBody = init.body as ReadableStream<Uint8Array | string>;
     const [bodyForHashing, bodyForFetch] = readableBody.tee();
     (init as ExtendedRequestInit)._ogBody = bodyForFetch;
-    pushBodyBytes(await readBodyStreamWithinLimit(bodyForHashing));
+    pushBodyBytes(await readBodyStreamWithinLimit(bodyForHashing, signal));
   } else if (init?.body instanceof URLSearchParams) {
     // URLSearchParams — .toString() gives a stable serialization
     (init as ExtendedRequestInit)._ogBody = init.body;
@@ -441,24 +454,20 @@ async function serializeBody(
     if (!hasEffectiveContentType) {
       defaultContentType = probeContentType;
     }
-    if (probeContentType !== undefined) {
-      // The runtime stringified the body, so the original can be sent again.
-      pushBodyBytes(await readBodyStreamWithinLimit(probeBody));
-    } else {
-      // Iterating the body may have consumed it, so the real fetch must send
-      // the bytes read here instead of the original.
-      const [bodyForHashing, bodyForFetch] = probeBody.tee();
-      let bytes: Uint8Array;
-      try {
-        bytes = await readBodyStreamWithinLimit(bodyForHashing);
-      } catch (err) {
-        (init as ExtendedRequestInit)._ogBody = bodyForFetch;
-        (init as RequestInit & { duplex?: string }).duplex = "half";
-        throw err;
-      }
-      void bodyForFetch.cancel().catch(() => {});
+    if (probeContentType?.toLowerCase() === "text/plain;charset=utf-8") {
+      // The runtime stringified the body. Send the string that was keyed, as
+      // stringifying the original again may not give the same result.
+      const bytes = await readBodyStreamWithinLimit(probeBody, signal);
       pushBodyBytes(bytes);
-      (init as ExtendedRequestInit)._ogBody = bytes as Uint8Array<ArrayBuffer>;
+      (init as ExtendedRequestInit)._ogBody = new TextDecoder().decode(bytes);
+    } else if (probeContentType !== undefined) {
+      throw new SkipCacheKeyGenerationError();
+    } else {
+      // Iterating the body may have consumed it, so the real fetch sends the
+      // other branch of what was read here.
+      const [bodyForHashing, bodyForFetch] = probeBody.tee();
+      (init as ExtendedRequestInit)._ogBody = bodyForFetch;
+      pushBodyBytes(await readBodyStreamWithinLimit(bodyForHashing, signal));
     }
   } else if (input instanceof Request && input.body) {
     let chunks: Uint8Array[];
