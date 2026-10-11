@@ -3338,6 +3338,40 @@ describe("fetch cache shim", () => {
       expect(fetchMock).toHaveBeenCalledTimes(2);
     });
 
+    it("keys stream chunks by their real bytes, whatever their accessors return", async () => {
+      const encode = (text: string) => new TextEncoder().encode(text);
+      const makeStream = (chunk: unknown) =>
+        new ReadableStream<unknown>({
+          start(controller) {
+            controller.enqueue(chunk);
+            controller.close();
+          },
+        }) as ReadableStream<Uint8Array>;
+      const lying = <T extends object>(view: T, buffer: ArrayBuffer) =>
+        Object.defineProperties(view, {
+          buffer: { get: () => buffer },
+          byteOffset: { get: () => 0 },
+          byteLength: { get: () => buffer.byteLength },
+        });
+      const read = async (body: BodyInit) => {
+        startNewFetchCacheScope();
+        const res = await fetch("https://api.example.com/body-stream-accessors", {
+          method: "POST",
+          body,
+          next: { revalidate: 60 },
+        });
+        return (await res.json()).count as number;
+      };
+
+      expect(await read(makeStream(new DataView(encode("BBBB").buffer)))).toBe(1);
+      expect(
+        await read(makeStream(lying(new DataView(encode("AAAA").buffer), encode("BBBB").buffer))),
+      ).toBe(2);
+      expect(await read(makeStream(encode("BBBB")))).toBe(3);
+      expect(await read(makeStream(lying(encode("AAAA"), encode("BBBB").buffer)))).toBe(4);
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+    });
+
     it("skips the cache for a stream chunk that is not bytes or text", async () => {
       const makeStream = () =>
         new ReadableStream<unknown>({

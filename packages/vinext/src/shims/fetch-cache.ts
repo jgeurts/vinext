@@ -279,16 +279,24 @@ async function readRequestBodyChunksWithinLimit(
 
 type BodyStreamPart = { kind: string; bytes: Uint8Array };
 
-// Native accessors read internal slots, so a chunk cannot fake its type.
+// Native accessors read internal slots, so a chunk cannot fake its type or
+// show the key different bytes from the ones the runtime sends.
 /* oxlint-disable typescript/unbound-method */
-const typedArrayName = Object.getOwnPropertyDescriptor(
-  Object.getPrototypeOf(Uint8Array.prototype) as object,
-  Symbol.toStringTag,
-)!.get!;
-const arrayBufferByteLength = Object.getOwnPropertyDescriptor(
-  ArrayBuffer.prototype,
-  "byteLength",
-)!.get!;
+const nativeGetter = (target: object, key: PropertyKey) =>
+  Object.getOwnPropertyDescriptor(target, key)!.get!;
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const typedArrayName = nativeGetter(typedArrayPrototype, Symbol.toStringTag);
+const arrayBufferByteLength = nativeGetter(ArrayBuffer.prototype, "byteLength");
+const typedArrayView = {
+  buffer: nativeGetter(typedArrayPrototype, "buffer"),
+  byteOffset: nativeGetter(typedArrayPrototype, "byteOffset"),
+  byteLength: nativeGetter(typedArrayPrototype, "byteLength"),
+};
+const dataViewView = {
+  buffer: nativeGetter(DataView.prototype, "buffer"),
+  byteOffset: nativeGetter(DataView.prototype, "byteOffset"),
+  byteLength: nativeGetter(DataView.prototype, "byteLength"),
+};
 /* oxlint-enable typescript/unbound-method */
 
 function isArrayBuffer(value: unknown): value is ArrayBuffer {
@@ -308,13 +316,17 @@ function bodyChunkToPart(chunk: unknown, encoder: TextEncoder): BodyStreamPart {
   if (typeof chunk === "string") return { kind: "string", bytes: encoder.encode(chunk) };
   if (ArrayBuffer.isView(chunk)) {
     const name: unknown = typedArrayName.call(chunk);
-    if (name === "Uint8Array") return { kind: "bytes", bytes: chunk as Uint8Array };
-    return {
-      kind: name === undefined ? "DataView" : "TypedArray",
-      bytes: new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength),
-    };
+    const view = name === undefined ? dataViewView : typedArrayView;
+    // Copy the bytes, so the key keeps what was read here.
+    const bytes = new Uint8Array(
+      view.buffer.call(chunk) as ArrayBuffer,
+      view.byteOffset.call(chunk) as number,
+      view.byteLength.call(chunk) as number,
+    ).slice();
+    if (name === "Uint8Array") return { kind: "bytes", bytes };
+    return { kind: name === undefined ? "DataView" : "TypedArray", bytes };
   }
-  if (isArrayBuffer(chunk)) return { kind: "ArrayBuffer", bytes: new Uint8Array(chunk) };
+  if (isArrayBuffer(chunk)) return { kind: "ArrayBuffer", bytes: new Uint8Array(chunk).slice() };
   throw new SkipCacheKeyGenerationError();
 }
 
