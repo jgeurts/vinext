@@ -279,20 +279,42 @@ async function readRequestBodyChunksWithinLimit(
 
 type BodyStreamPart = { kind: string; bytes: Uint8Array };
 
+// Native accessors read internal slots, so a chunk cannot fake its type.
+/* oxlint-disable typescript/unbound-method */
+const typedArrayName = Object.getOwnPropertyDescriptor(
+  Object.getPrototypeOf(Uint8Array.prototype) as object,
+  Symbol.toStringTag,
+)!.get!;
+const arrayBufferByteLength = Object.getOwnPropertyDescriptor(
+  ArrayBuffer.prototype,
+  "byteLength",
+)!.get!;
+/* oxlint-enable typescript/unbound-method */
+
+function isArrayBuffer(value: unknown): value is ArrayBuffer {
+  try {
+    arrayBufferByteLength.call(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Workers streams built from iterables yield chunks as given, and runtimes
-// differ in which chunk types they send or reject (Node only sends Uint8Array
+// differ in which chunk types they send or reject (Node rejects ArrayBuffer
 // chunks). Key other chunks by their type too, so a body one runtime rejects
-// never shares a key with a valid Uint8Array body.
+// never shares a key with a valid body.
 function bodyChunkToPart(chunk: unknown, encoder: TextEncoder): BodyStreamPart {
-  if (chunk instanceof Uint8Array) return { kind: "bytes", bytes: chunk };
   if (typeof chunk === "string") return { kind: "string", bytes: encoder.encode(chunk) };
-  if (chunk instanceof ArrayBuffer) return { kind: "ArrayBuffer", bytes: new Uint8Array(chunk) };
   if (ArrayBuffer.isView(chunk)) {
+    const name: unknown = typedArrayName.call(chunk);
+    if (name === "Uint8Array") return { kind: "bytes", bytes: chunk as Uint8Array };
     return {
-      kind: Object.prototype.toString.call(chunk).slice(8, -1),
+      kind: name === undefined ? "DataView" : "TypedArray",
       bytes: new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength),
     };
   }
+  if (isArrayBuffer(chunk)) return { kind: "ArrayBuffer", bytes: new Uint8Array(chunk) };
   throw new SkipCacheKeyGenerationError();
 }
 

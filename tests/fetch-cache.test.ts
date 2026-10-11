@@ -3309,6 +3309,35 @@ describe("fetch cache shim", () => {
       expect(fetchMock).toHaveBeenCalledTimes(4);
     });
 
+    it("keys stream chunks by their real type, whatever they claim to be", async () => {
+      const bytes = new TextEncoder().encode("same");
+      const makeStream = (chunk: unknown) =>
+        new ReadableStream<unknown>({
+          start(controller) {
+            controller.enqueue(chunk);
+            controller.close();
+          },
+        }) as ReadableStream<Uint8Array>;
+      const taggedView = (tag: string) =>
+        Object.defineProperty(new DataView(bytes.slice().buffer), Symbol.toStringTag, {
+          value: tag,
+        });
+      const read = async (body: BodyInit) => {
+        startNewFetchCacheScope();
+        const res = await fetch("https://api.example.com/body-stream-tagged", {
+          method: "POST",
+          body,
+          next: { revalidate: 60 },
+        });
+        return (await res.json()).count as number;
+      };
+
+      expect(await read(makeStream(bytes.slice().buffer))).toBe(1);
+      expect(await read(makeStream(taggedView("ArrayBuffer")))).toBe(2);
+      expect(await read(makeStream(taggedView("x".repeat(1024 * 1024))))).toBe(2);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
     it("skips the cache for a stream chunk that is not bytes or text", async () => {
       const makeStream = () =>
         new ReadableStream<unknown>({
