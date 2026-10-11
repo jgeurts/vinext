@@ -3554,53 +3554,53 @@ describe("fetch cache shim", () => {
       expect((fetchMock.mock.calls[0][1] as RequestInit).body).toBe(large);
     });
 
-    it("keys the headers a body's own code leaves for the real fetch", async () => {
-      const headers = new Headers();
-      const makeBody = (variant: string) =>
-        ({
-          toString: () => {
-            headers.set("x-variant", variant);
-            return "same";
-          },
-        }) as unknown as BodyInit;
+    // fetch takes the target and headers before any body code runs, so code
+    // in the body cannot change what is keyed or sent.
+    it("keys and sends the headers from before a body's own code runs", async () => {
+      const headers = new Headers({ "x-variant": "a" });
       const read = async (variant: string) => {
         startNewFetchCacheScope();
         const res = await fetch("https://api.example.com/body-mutates-headers", {
           method: "POST",
           headers,
-          body: makeBody(variant),
+          body: {
+            toString: () => {
+              headers.set("x-variant", variant);
+              headers.delete("content-type");
+              return "same";
+            },
+          } as unknown as BodyInit,
           next: { revalidate: 60 },
         });
         return (await res.json()).count as number;
       };
 
-      expect(await read("a")).toBe(1);
+      expect(await read("b")).toBe(1);
+      const sent = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
+      expect(sent.get("x-variant")).toBe("a");
+
+      // The headers now say "b", so this is a different request.
       expect(await read("b")).toBe(2);
-      expect(await read("b")).toBe(2);
+      headers.set("x-variant", "a");
+      expect(await read("c")).toBe(1);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
     });
 
-    it("keys the content type inferred once a body's own code drops the header", async () => {
-      const read = async (body: BodyInit, headers?: Headers) => {
-        startNewFetchCacheScope();
-        const res = await fetch("https://api.example.com/body-drops-content-type", {
-          method: "POST",
-          headers,
-          body,
-          next: { revalidate: 60 },
-        });
-        return (await res.json()).count as number;
-      };
-      const headers = new Headers({ "content-type": "application/json" });
-      const body = {
-        toString: () => {
-          headers.delete("content-type");
-          return "same";
-        },
-      } as unknown as BodyInit;
+    it("keys and sends the URL from before a body's own code runs", async () => {
+      const url = new URL("https://api.example.com/body-mutates-url/a");
+      async function* body(path: string) {
+        url.pathname = path;
+        yield new TextEncoder().encode("same");
+      }
 
-      expect(await read(new TextEncoder().encode("same"))).toBe(1);
-      expect(await read(body, headers)).toBe(2);
-      expect(await read("same")).toBe(2);
+      await fetch(url, {
+        method: "POST",
+        body: body("/body-mutates-url/b") as unknown as BodyInit,
+        duplex: "half",
+        next: { revalidate: 60 },
+      } as RequestInit);
+
+      expect(fetchMock.mock.calls[0][0]).toBe("https://api.example.com/body-mutates-url/a");
     });
 
     it("keys bodies the runtime stringifies by their string form", async () => {

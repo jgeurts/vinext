@@ -542,9 +542,9 @@ async function serializeBody(
       throw new SkipCacheKeyGenerationError();
     }
     const probeContentType = probe.headers.get("content-type") ?? undefined;
-    // Reading the body runs its own code, which may change the headers, so
-    // the key applies this type only if the final headers have none.
-    defaultContentType = probeContentType;
+    if (!hasEffectiveContentType) {
+      defaultContentType = probeContentType;
+    }
     if (probeContentType?.toLowerCase() === "text/plain;charset=utf-8") {
       // The runtime stringified the body. Send what it extracted, as
       // stringifying the original again may not give the same result.
@@ -636,11 +636,6 @@ async function buildFetchCacheKey(
   input: string | URL | Request,
   init?: RequestInit & { next?: NextFetchOptions },
 ): Promise<string> {
-  // Reading the body can run user code (toString(), iterators) that changes
-  // the URL or headers, so read them afterwards, as the real fetch sees them.
-  const { bodyChunks, canonicalizedContentType, defaultContentType, bodyMetadata } =
-    await serializeBody(input, init);
-
   let url: string;
   const inputRequest = input instanceof Request ? input : undefined;
 
@@ -655,6 +650,8 @@ async function buildFetchCacheKey(
   const method = normalizeFetchMethod(init?.method ?? inputRequest?.method ?? "GET");
 
   const headers = collectHeaders(input, init);
+  const { bodyChunks, canonicalizedContentType, defaultContentType, bodyMetadata } =
+    await serializeBody(input, init);
   if (canonicalizedContentType) {
     headers["content-type"] = canonicalizedContentType;
   } else if (defaultContentType && headers["content-type"] === undefined) {
@@ -1389,6 +1386,13 @@ function createPatchedFetch(): typeof globalThis.fetch {
 
     const softTags = _getState().currentFetchSoftTags;
     let fetchInit = stripNextFromInit(init, cacheDirective);
+    if (fetchInit?.body !== undefined && fetchInit.body !== null) {
+      // Reading the body for the key can run its own code (toString(),
+      // iterators, stream sources). Like fetch, take the target and headers
+      // before that code runs, and key and send that snapshot.
+      if (input instanceof URL) input = input.href;
+      fetchInit.headers = new Headers(getEffectiveRequestHeaders(input, fetchInit));
+    }
     let cacheKey: string;
     try {
       cacheKey = await buildFetchCacheKey(input, fetchInit);
