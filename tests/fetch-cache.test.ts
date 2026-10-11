@@ -3264,30 +3264,49 @@ describe("fetch cache shim", () => {
           },
         }) as ReadableStream<Uint8Array>;
       };
+      const read = async (body: BodyInit) => {
+        startNewFetchCacheScope();
+        const res = await fetch("https://api.example.com/body-stream-buffers", {
+          method: "POST",
+          body,
+          next: { revalidate: 60 },
+        });
+        return (await res.json()).count as number;
+      };
 
-      const res1 = await fetch("https://api.example.com/body-stream-buffers", {
-        method: "POST",
-        body: makeStream("abcdef"),
-        next: { revalidate: 60 },
-      });
-      expect((await res1.json()).count).toBe(1);
-
-      startNewFetchCacheScope();
-      const res2 = await fetch("https://api.example.com/body-stream-buffers", {
-        method: "POST",
-        body: makeStream("abcdeg"),
-        next: { revalidate: 60 },
-      });
-      expect((await res2.json()).count).toBe(2);
-
-      startNewFetchCacheScope();
-      const res3 = await fetch("https://api.example.com/body-stream-buffers", {
-        method: "POST",
-        body: new TextEncoder().encode("abcdef"),
-        next: { revalidate: 60 },
-      });
-      expect((await res3.json()).count).toBe(1);
+      expect(await read(makeStream("abcdef"))).toBe(1);
+      expect(await read(makeStream("abcdeg"))).toBe(2);
+      expect(await read(makeStream("abcdef"))).toBe(1);
       expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    // Node rejects a stream body with non-Uint8Array chunks, so it must not be
+    // answered from a valid body's entry.
+    it("keys stream chunks of other types apart from the same bytes", async () => {
+      const bytes = new TextEncoder().encode("same");
+      const makeStream = (chunk: unknown) =>
+        new ReadableStream<unknown>({
+          start(controller) {
+            controller.enqueue(chunk);
+            controller.close();
+          },
+        }) as ReadableStream<Uint8Array>;
+      const read = async (body: BodyInit) => {
+        startNewFetchCacheScope();
+        const res = await fetch("https://api.example.com/body-stream-chunk-types", {
+          method: "POST",
+          body,
+          next: { revalidate: 60 },
+        });
+        return (await res.json()).count as number;
+      };
+
+      expect(await read(bytes)).toBe(1);
+      expect(await read(makeStream(bytes.slice()))).toBe(1);
+      expect(await read(makeStream(bytes.slice().buffer))).toBe(2);
+      expect(await read(makeStream("same"))).toBe(3);
+      expect(await read(makeStream(new DataView(bytes.slice().buffer)))).toBe(4);
+      expect(fetchMock).toHaveBeenCalledTimes(4);
     });
 
     it("skips the cache for a stream chunk that is not bytes or text", async () => {
