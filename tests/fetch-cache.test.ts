@@ -3694,6 +3694,25 @@ describe("fetch cache shim", () => {
       expect(await read(new Request(url, { method: "POST", redirect: "manual" }), false)).toBe(2);
     });
 
+    it("converts request options once, like fetch", async () => {
+      let converted = 0;
+      const redirect = { toString: () => (converted++ === 0 ? "follow" : "manual") };
+      async function* body() {
+        yield new TextEncoder().encode("same");
+      }
+
+      await fetch("https://api.example.com/body-option-converted-once", {
+        method: "POST",
+        redirect: redirect as unknown as RequestRedirect,
+        body: body() as unknown as BodyInit,
+        duplex: "half",
+        next: { revalidate: 60 },
+      } as RequestInit);
+
+      expect(converted).toBe(1);
+      expect((fetchMock.mock.calls[0][1] as RequestInit).redirect).toBe("follow");
+    });
+
     it("keys and sends the URL from before a body's own code runs", async () => {
       const url = new URL("https://api.example.com/body-mutates-url/a");
       async function* body(path: string) {

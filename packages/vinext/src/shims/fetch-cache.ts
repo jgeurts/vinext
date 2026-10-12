@@ -64,6 +64,20 @@ const MAX_CACHE_KEY_BODY_BYTES = 1024 * 1024; // 1 MiB
 // the bytes: a million one-byte chunks would cost far more than 1 MiB.
 const MAX_CACHE_KEY_BODY_CHUNKS = 16_384;
 
+// RequestInit members a Request converts to strings.
+const REQUEST_STRING_OPTIONS = [
+  "cache",
+  "credentials",
+  "duplex",
+  "integrity",
+  "method",
+  "mode",
+  "priority",
+  "redirect",
+  "referrer",
+  "referrerPolicy",
+];
+
 // "Cache indefinitely" duration — mirrors upstream's CACHE_ONE_YEAR_SECONDS.
 const ONE_YEAR_SECONDS = 31536000;
 
@@ -1405,10 +1419,17 @@ function createPatchedFetch(): typeof globalThis.fetch {
       // iterators, stream sources). Like fetch, take the target and headers
       // before that code runs, and key and send that snapshot.
       if (input instanceof URL) input = String(input);
-      fetchInit = {
+      const snapshot: Record<string, unknown> = {
         ...fetchInit,
         headers: new Headers(getEffectiveRequestHeaders(input, fetchInit)),
       };
+      // Convert each string option once, as fetch does, so the body probe,
+      // the key and the real fetch all use the same value.
+      for (const option of REQUEST_STRING_OPTIONS) {
+        // oxlint-disable-next-line typescript/no-base-to-string -- the conversion fetch applies
+        if (snapshot[option] !== undefined) snapshot[option] = String(snapshot[option]);
+      }
+      fetchInit = snapshot as RequestInit;
     }
     let cacheKey: string;
     try {
