@@ -1,5 +1,26 @@
 # @vinext/cloudflare
 
+## 1.1.1
+
+### Bug Fixes
+
+#### Cloudflare
+
+- make --warm-cache-include-fallbacks a no-op (#3906)
+- answer a stored page's conditional request as Next.js does (#3832)
+- never store a conditional request's 304 in the Response Store (#3827)
+- keep Workers Cache off Worker-wide in every generated config (#3820)
+
+#### Misc
+
+- **Cache:** treat x-api-key as a credential for shared response caches (#3879)
+- **PPR:** key fallback shells apart from the pages of their literal paths (#3891)
+- **Cache:** key oversized cache identities by a SHA-256 digest (#3876)
+
+### Contributors
+
+- @james-elicx
+
 ## 1.1.0
 
 ### Features
