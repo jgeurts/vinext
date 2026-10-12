@@ -3580,6 +3580,7 @@ describe("fetch cache shim", () => {
       const invalid: [string | Request, RequestInit][] = [
         [url, { method: "GET" }],
         [url, { method: "PUT", mode: "no-cors" }],
+        [url, { method: "POST", cache: "only-if-cached" }],
         [new Request(url, { method: "POST", keepalive: true }), {}],
       ];
       for (const [input, init] of invalid) {
@@ -3670,6 +3671,27 @@ describe("fetch cache shim", () => {
       headers.set("x-variant", "a");
       expect(await read("c")).toBe(1);
       expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("keys a Request's options from before its body code runs", async () => {
+      const url = "https://api.example.com/body-shadows-request-options";
+      const read = async (request: Request, shadow: boolean) => {
+        startNewFetchCacheScope();
+        async function* body() {
+          if (shadow) Object.defineProperty(request, "redirect", { value: "manual" });
+          yield new TextEncoder().encode("same");
+        }
+        const res = await fetch(request, {
+          body: body() as unknown as BodyInit,
+          duplex: "half",
+          next: { revalidate: 60 },
+        } as RequestInit);
+        return (await res.json()).count as number;
+      };
+
+      // fetch still follows redirects for this one, so it is keyed as such.
+      expect(await read(new Request(url, { method: "POST" }), true)).toBe(1);
+      expect(await read(new Request(url, { method: "POST", redirect: "manual" }), false)).toBe(2);
     });
 
     it("keys and sends the URL from before a body's own code runs", async () => {

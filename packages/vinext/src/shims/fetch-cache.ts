@@ -542,14 +542,7 @@ async function serializeBody(
     // the runtime rejects an invalid body before any of it is read, even when
     // the response then comes from the cache. Empty headers leave only the
     // content type the runtime infers from the body.
-    const probe = new Request(input, {
-      method: init.method,
-      mode: init.mode,
-      keepalive: init.keepalive,
-      duplex: (init as RequestInit & { duplex?: string }).duplex,
-      headers: {},
-      body: init.body,
-    } as RequestInit);
+    const probe = new Request(input, { ...init, headers: {}, body: init.body });
     const probeBody = probe.body;
     if (!probeBody) {
       throw new SkipCacheKeyGenerationError();
@@ -664,6 +657,16 @@ async function buildFetchCacheKey(
   const method = normalizeFetchMethod(init?.method ?? inputRequest?.method ?? "GET");
 
   const headers = collectHeaders(input, init);
+  // Read the request's options before the body's own code can run.
+  const requestOptions = [
+    init?.mode ?? inputRequest?.mode ?? "cors",
+    init?.redirect ?? inputRequest?.redirect ?? "follow",
+    init?.credentials ?? inputRequest?.credentials ?? "same-origin",
+    init?.referrer ?? inputRequest?.referrer ?? "about:client",
+    init?.referrerPolicy ?? inputRequest?.referrerPolicy ?? "",
+    init?.integrity ?? inputRequest?.integrity ?? "",
+    init?.cache ?? inputRequest?.cache ?? "default",
+  ];
   const { bodyChunks, canonicalizedContentType, defaultContentType, bodyMetadata } =
     await serializeBody(input, init);
   if (canonicalizedContentType) {
@@ -677,13 +680,7 @@ async function buildFetchCacheKey(
     url,
     method,
     headers,
-    init?.mode ?? inputRequest?.mode ?? "cors",
-    init?.redirect ?? inputRequest?.redirect ?? "follow",
-    init?.credentials ?? inputRequest?.credentials ?? "same-origin",
-    init?.referrer ?? inputRequest?.referrer ?? "about:client",
-    init?.referrerPolicy ?? inputRequest?.referrerPolicy ?? "",
-    init?.integrity ?? inputRequest?.integrity ?? "",
-    init?.cache ?? inputRequest?.cache ?? "default",
+    ...requestOptions,
     bodyChunks,
     bodyMetadata,
   ]);
