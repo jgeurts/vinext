@@ -3570,6 +3570,32 @@ describe("fetch cache shim", () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
+    it("rejects a request fetch would reject before reading its iterable body", async () => {
+      let pulls = 0;
+      async function* body() {
+        pulls++;
+        yield new TextEncoder().encode("same");
+      }
+      const url = "https://api.example.com/body-iterable-invalid-request";
+      const invalid: [string | Request, RequestInit][] = [
+        [url, { method: "GET" }],
+        [url, { method: "PUT", mode: "no-cors" }],
+        [new Request(url, { method: "POST", keepalive: true }), {}],
+      ];
+      for (const [input, init] of invalid) {
+        await expect(
+          fetch(input, {
+            ...init,
+            body: body() as unknown as BodyInit,
+            duplex: "half",
+            next: { revalidate: 60 },
+          } as RequestInit),
+        ).rejects.toThrow(TypeError);
+      }
+      expect(pulls).toBe(0);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
     it("sends a stringified body with its leading BOM", async () => {
       await fetch("https://api.example.com/body-stringified-bom", {
         method: "POST",

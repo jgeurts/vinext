@@ -538,13 +538,17 @@ async function serializeBody(
     // will send, so different bodies never share a key.
     // A body the runtime rejects rejects this fetch as natively, without
     // extracting the body a second time.
-    // The caller's duplex and keepalive let the runtime reject the body as
-    // fetch would, even when the response then comes from the cache.
-    const probe = new Request("http://localhost/", {
-      method: "POST",
-      body: init.body,
-      duplex: (init as RequestInit & { duplex?: string }).duplex,
+    // Build the request as fetch would (inheriting from a Request input), so
+    // the runtime rejects an invalid body before any of it is read, even when
+    // the response then comes from the cache. Empty headers leave only the
+    // content type the runtime infers from the body.
+    const probe = new Request(input, {
+      method: init.method,
+      mode: init.mode,
       keepalive: init.keepalive,
+      duplex: (init as RequestInit & { duplex?: string }).duplex,
+      headers: {},
+      body: init.body,
     } as RequestInit);
     const probeBody = probe.body;
     if (!probeBody) {
